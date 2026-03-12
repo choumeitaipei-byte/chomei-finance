@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>洲美扶輪社應收款管理系統</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Firebase SDK v11.6.1 -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, doc, onSnapshot, setDoc, addDoc, deleteDoc, query } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        window.FB_CORE = { initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, getFirestore, collection, doc, onSnapshot, setDoc, addDoc, deleteDoc, query };
+    </script>
+
+    <style>
+        body { font-family: "Microsoft JhengHei", "PingFang TC", sans-serif; }
+        .tab-active { background-color: #1e3a8a; color: white; box-shadow: 0 10px 15px -3px rgba(30, 58, 138, 0.4); }
+        .bg-rotary { background-color: #1e3a8a; } /* 扶輪深藍 */
+    </style>
+</head>
+<body class="bg-[#F3F4F6] text-slate-800">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo } = React;
+
+        // --- 外部託管配置 (如果您要放到 GitHub 或 Netlify) ---
+        // 請在此填入您的 Firebase 專案 Config：
+        const EXTERNAL_CONFIG = null; 
+
+        // 系統常數
+        const FIXED_BASE = 1292 + 550 + 600 + 600 + 1360; // RI + 地區 + 基金 + 年會 + 雜誌
+        const FIXED_SHARE = 700; // 執秘指定之固定分攤
+
+        const App = () => {
+            const [user, setUser] = useState(null);
+            const [db, setDb] = useState(null);
+            const [activeTab, setActiveTab] = useState('dashboard');
+            const [currentMonth, setCurrentMonth] = useState('115.02');
+            const [searchTerm, setSearchTerm] = useState('');
+            const [error, setError] = useState(null);
+
+            // 資料儲存箱
+            const [members, setMembers] = useState([]);
+            const [transactions, setTransactions] = useState([]);
+            const [fieldConfigs, setFieldConfigs] = useState([]);
+            const [monthlyValues, setMonthlyValues] = useState({});
+
+            // 1. 啟動 Firebase
+            useEffect(() => {
+                const init = async () => {
+                    const { initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, getFirestore } = window.FB_CORE;
+                    try {
+                        let config = null;
+                        if (typeof __firebase_config !== 'undefined') config = JSON.parse(__firebase_config);
+                        else if (EXTERNAL_CONFIG) config = EXTERNAL_CONFIG;
+
+                        if (!config) { setError("尚未設定連線金鑰。"); return; }
+                        
+                        const app = initializeApp(config);
+                        const auth = getAuth(app);
+                        const firestore = getFirestore(app);
+                        setDb(firestore);
+
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await signInWithCustomToken(auth, __initial_auth_token);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                        onAuthStateChanged(auth, setUser);
+                    } catch (err) { setError("連線發生錯誤：" + err.message); }
+                };
+                const timer = setInterval(() => { if (window.FB_CORE) { clearInterval(timer); init(); } }, 100);
+            }, []);
+
+            // 2. 監聽雲端數據
+            useEffect(() => {
+                if (!user || !db) return;
+                const { collection, onSnapshot } = window.FB_CORE;
+                const appId = typeof __app_id !== 'undefined' ? __app_id : 'rotary-shomei-final';
+                const base = `artifacts/${appId}/public/data`;
+
+                onSnapshot(collection(db, base, 'members'), s => setMembers(s.docs.map(d=>({id:d.id, ...d.data()}))));
+                onSnapshot(collection(db, base, 'transactions'), s => setTransactions(s.docs.map(d=>({id:d.id, ...d.data()}))));
+                onSnapshot(collection(db, base, 'field_configs'), s => setFieldConfigs(s.docs.map(d=>({id:d.id, ...d.data()}))));
+                onSnapshot(collection(db, base, 'monthly_values'), s => {
+                    const data = {};
+                    s.docs.forEach(d => data[d.id] = d.data());
+                    setMonthlyValues(data);
+                });
+            }, [user, db]);
+
+            // 3. 年度統計邏輯
+            const yearlyStats = useMemo(() => {
+                const year = currentMonth.split('.')[0];
+                return members.map(m => {
+                    let totalDues = 0, totalCustoms = 0, activeMonths = 0;
+                    // 掃描 1-12 月
+                    for (let i = 1; i <= 12; i++) {
+                        const mStr = String(i).padStart(2, '0');
+                        const key = `${m.id}_${year}.${mStr}`;
+                        const val = monthlyValues[key];
+                        if (val) {
+                            totalDues += val.isOnLeave ? 1300 : 2600;
+                            fieldConfigs.forEach(f => totalCustoms += Number(val.customAmounts?.[f.id] || 0));
+                            activeMonths++;
+                        }
+                    }
+                    const totalFixed = activeMonths * (FIXED_BASE + FIXED_SHARE);
+                    const totalMisc = transactions.filter(t => t.memberId === m.id && t.month.startsWith(year)).reduce((s, t) => s + Number(t.amount || 0), 0);
+                    
+                    return { ...m, totalDues, totalFixed, totalCustoms, totalMisc, totalYearly: totalDues + totalFixed + totalCustoms + totalMisc, activeMonths };
+                }).sort((a,b) => a.name.localeCompare(b.name, 'zh-Hant'));
+            }, [members, monthlyValues, transactions, fieldConfigs, currentMonth]);
+
+            // 4. 月度統計邏輯
+            const monthlyReport = useMemo(() => {
+                return members.map(m => {
+                    const key = `${m.id}_${currentMonth}`;
+                    const val = monthlyValues[key] || { isOnLeave: false, customAmounts: {} };
+                    const dues = val.isOnLeave ? 1300 : 2600;
+                    const customs = fieldConfigs.reduce((s, f) => s + Number(val.customAmounts?.[f.id] || 0), 0);
+                    const misc = transactions.filter(t => t.memberId === m.id && t.month === currentMonth).reduce((s, t) => s + Number(t.amount || 0), 0);
+                    const monthTotal = dues + FIXED_BASE + FIXED_SHARE + customs + misc;
+                    
+                    return { ...m, ...val, dues, customs, misc, monthTotal, prevBalance: val.prevBalance || 0, finalTotal: monthTotal + (val.prevBalance || 0) };
+                }).sort((a,b) => a.name.localeCompare(b.name, 'zh-Hant'));
+            }, [members, monthlyValues, transactions, fieldConfigs, currentMonth]);
+
+            const filtered = activeTab === 'yearly' ? yearlyStats.filter(r => r.name.includes(searchTerm)) : monthlyReport.filter(r => r.name.includes(searchTerm));
+
+            if (!user) return <div className="h-screen flex items-center justify-center bg-rotary text-white font-bold animate-pulse">洲美雲端數據連接中...</div>;
+
+            return (
+                <div className="min-h-screen flex flex-col lg:flex-row">
+                    {/* 左側選單 */}
+                    <aside className="w-full lg:w-64 bg-slate-900 text-white p-6 flex flex-col gap-8 shadow-2xl">
+                        <div className="border-b border-slate-700 pb-4">
+                            <h1 className="text-2xl font-black text-blue-400 font-mono tracking-tighter italic">洲美扶輪社</h1>
+                            <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest">Rotary Finance Pro</p>
+                        </div>
+                        <nav className="flex flex-col gap-2 font-bold text-sm">
+                            <TabBtn active={activeTab==='dashboard'} onClick={()=>setActiveTab('dashboard')} icon="📊" label="月報：應收款" />
+                            <TabBtn active={activeTab==='yearly'} onClick={()=>setActiveTab('yearly')} icon="📅" label="年度收支總結" />
+                            <TabBtn active={activeTab==='input'} onClick={()=>setActiveTab('input')} icon="⚖️" label="請假/規費調整" />
+                            <TabBtn active={activeTab==='trans'} onClick={()=>setActiveTab('trans')} icon="📝" label="流水帳記帳" />
+                            <TabBtn active={activeTab==='settings'} onClick={()=>setActiveTab('settings')} icon="⚙️" label="名單與系統設定" />
+                        </nav>
+                        <div className="mt-auto p-4 bg-slate-800 rounded-2xl border border-slate-700">
+                            <label className="text-[10px] text-slate-500 font-bold uppercase block mb-1">目前作業月份</label>
+                            <div className="flex justify-between items-center font-black">
+                                <span className="text-blue-400 font-mono">{currentMonth}</span>
+                                <button onClick={()=>setCurrentMonth(prompt('輸入月份(YYY.MM):', currentMonth))} className="text-xs bg-slate-700 px-2 py-1 rounded">切換</button>
+                            </div>
+                        </div>
+                    </aside>
+
+                    {/* 主內容區 */}
+                    <main className="flex-1 p-6 lg:p-12 overflow-auto">
+                        <header className="flex flex-col md:flex-row justify-between items-center mb-10 gap-4">
+                            <h2 className="text-3xl font-black text-slate-800">
+                                {activeTab==='dashboard' && "月度彙整報告"}
+                                {activeTab==='yearly' && `${currentMonth.split('.')[0]} 年度收支統計`}
+                                {activeTab==='input' && "變動數值調整"}
+                                {activeTab==='trans' && "流水帳管理"}
+                                {activeTab==='settings' && "系統設定"}
+                            </h2>
+                            <div className="relative w-full md:w-72">
+                                <input 
+                                    type="text" placeholder="搜尋社友..." 
+                                    className="w-full pl-10 pr-4 py-3 bg-white border border-slate-200 rounded-2xl shadow-sm outline-none focus:ring-2 focus:ring-blue-500"
+                                    onChange={e=>setSearchTerm(e.target.value)}
+                                />
+                                <span className="absolute left-4 top-3.5 opacity-30">🔍</span>
+                            </div>
+                        </header>
+
+                        {/* 年度總結視圖 */}
+                        {activeTab === 'yearly' && (
+                            <div className="space-y-6 animate-in fade-in duration-500">
+                                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                    <StatCard title="年度應收總額" value={`$${yearlyStats.reduce((s,r)=>s+r.totalYearly, 0).toLocaleString()}`} color="blue" />
+                                    <StatCard title="年度代付款累計" value={`$${yearlyStats.reduce((s,r)=>s+r.totalMisc, 0).toLocaleString()}`} color="orange" />
+                                    <StatCard title="年度資料月份" value={`${Math.max(...yearlyStats.map(r=>r.activeMonths))} 個月`} color="slate" />
+                                </div>
+                                <div className="bg-white rounded-[2rem] shadow-xl border border-slate-100 overflow-hidden">
+                                    <table className="w-full text-sm text-left border-collapse">
+                                        <thead>
+                                            <tr className="bg-slate-50/50 text-slate-400 font-bold border-b border-slate-50">
+                                                <th className="p-5">社友姓名</th>
+                                                <th className="p-5 text-right">年度月費累計</th>
+                                                <th className="p-5 text-right">年度規費累計</th>
+                                                <th className="p-5 text-right">年度代付款累計</th>
+                                                <th className="p-5 text-right font-black text-blue-600 bg-blue-50/30">年度總結</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-slate-50">
+                                            {filtered.map(r => (
+                                                <tr key={r.id} className="hover:bg-slate-50 transition-colors">
+                                                    <td className="p-5 font-bold text-slate-800">{r.name} <span className="text-[10px] text-slate-400 font-normal">({r.nickname})</span></td>
+                                                    <td className="p-5 text-right font-mono">${r.totalDues.toLocaleString()}</td>
+                                                    <td className="p-5 text-right font-mono text-slate-400">${(r.totalFixed + r.totalCustoms).toLocaleString()}</td>
+                                                    <td className="p-5 text-right font-mono">${r.totalMisc.toLocaleString()}</td>
+                                                    <td className="p-5 text-right font-black text-blue-600 bg-blue-50/30 font-mono text-lg">${r.totalYearly.toLocaleString()}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* 月報總表 */}
+                        {activeTab === 'dashboard' && (
+                            <div className="bg-white rounded-[2rem] shadow-xl border border-slate-100 overflow-hidden">
+                                <table className="w-full text-sm text-left">
+                                    <thead className="bg-slate-50/50 text-slate-400 font-bold border-b">
+                                        <tr>
+                                            <th className="p-5">社友資訊</th>
+                                            <th className="p-5 text-right">月費(A)</th>
+                                            <th className="p-5 text-right text-slate-400">固定分攤(700)</th>
+                                            <th className="p-5 text-right">代付款(C)</th>
+                                            <th className="p-5 text-right font-black text-blue-600">本期應收(D)</th>
+                                            <th className="p-5 text-right font-black bg-blue-50/50 text-blue-900 text-lg">總結待請(H)</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-slate-50">
+                                        {filtered.map(r => (
+                                            <tr key={r.id} className="hover:bg-slate-50">
+                                                <td className="p-5 font-bold">
+                                                    <div className="text-slate-800">{r.name}</div>
+                                                    <div className="text-[10px] text-slate-400 font-bold">{r.nickname} {r.isOnLeave && <span className="text-orange-500">●請假</span>}</div>
+                                                </td>
+                                                <td className="p-5 text-right font-mono">${r.dues.toLocaleString()}</td>
+                                                <td className="p-5 text-right text-slate-400 font-mono">$700</td>
+                                                <td className="p-5 text-right font-mono">${r.misc.toLocaleString()}</td>
+                                                <td className="p-5 text-right font-black text-blue-600 font-mono">${r.monthTotal.toLocaleString()}</td>
+                                                <td className="p-5 text-right font-black bg-blue-50/30 text-blue-900 text-lg font-mono">${r.finalTotal.toLocaleString()}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        )}
+
+                        {/* 變動調整 */}
+                        {activeTab === 'input' && (
+                            <div className="space-y-3">
+                                {filtered.map(r => (
+                                    <div key={r.id} className="bg-white p-5 rounded-2xl border flex flex-wrap items-center gap-6 shadow-sm">
+                                        <div className="w-24 font-black text-slate-800">{r.name}</div>
+                                        <div className="flex flex-col gap-1">
+                                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">出席狀態</label>
+                                            <button 
+                                                onClick={() => {
+                                                    const { doc, setDoc } = window.FB_CORE;
+                                                    const appId = typeof __app_id !== 'undefined' ? __app_id : 'rotary-shomei-final';
+                                                    setDoc(doc(db, `artifacts/${appId}/public/data/monthly_values/${r.id}_${currentMonth}`), {isOnLeave: !r.isOnLeave}, {merge:true});
+                                                }}
+                                                className={`px-4 py-2 rounded-xl text-xs font-bold transition-all ${r.isOnLeave?'bg-orange-500 text-white shadow-lg shadow-orange-100':'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
+                                            >
+                                                {r.isOnLeave ? "已請假 $1300" : "出席中 $2600"}
+                                            </button>
+                                        </div>
+                                        {fieldConfigs.map(f => (
+                                            <div key={f.id} className="flex flex-col gap-1">
+                                                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{f.name}</label>
+                                                <input 
+                                                    type="number" placeholder="0" className="w-24 p-2 bg-slate-50 border-none rounded-lg text-sm font-bold"
+                                                    value={r.customAmounts?.[f.id] || ''}
+                                                    onChange={e => {
+                                                        const { doc, setDoc } = window.FB_CORE;
+                                                        const appId = typeof __app_id !== 'undefined' ? __app_id : 'rotary-shomei-final';
+                                                        const amt = Number(e.target.value);
+                                                        const customs = {...(r.customAmounts||{}), [f.id]: amt};
+                                                        setDoc(doc(db, `artifacts/${appId}/public/data/monthly_values/${r.id}_${currentMonth}`), {customAmounts: customs}, {merge:true});
+                                                    }}
+                                                />
+                                            </div>
+                                        ))}
+                                        <div className="ml-auto text-right">
+                                            <p className="text-[10px] font-bold text-slate-300 uppercase">本月應收累計</p>
+                                            <p className="text-xl font-black text-slate-800 font-mono">${(r.monthTotal - r.misc).toLocaleString()}</p>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+
+                        {/* 流水帳記帳 */}
+                        {activeTab === 'trans' && (
+                            <div className="max-w-4xl mx-auto space-y-6">
+                                <div className="bg-white p-8 rounded-[2rem] border border-blue-50 shadow-xl">
+                                    <h3 className="font-black text-xl mb-6 text-blue-600 flex items-center gap-2 tracking-tight"><span>➕</span> 快速錄入代付款項</h3>
+                                    <form className="grid grid-cols-1 md:grid-cols-4 gap-4" onSubmit={async e => {
+                                        e.preventDefault();
+                                        const { collection, addDoc } = window.FB_CORE;
+                                        const appId = typeof __app_id !== 'undefined' ? __app_id : 'rotary-shomei-final';
+                                        const form = e.target;
+                                        await addDoc(collection(db, `artifacts/${appId}/public/data/transactions`), {
+                                            memberId: form.member.value, month: currentMonth, date: form.date.value, item: form.item.value, amount: Number(form.amount.value)
+                                        });
+                                        form.reset();
+                                    }}>
+                                        <input name="date" type="date" className="p-3 bg-slate-50 border-none rounded-xl text-sm outline-none" defaultValue={new Date().toISOString().split('T')[0]} required />
+                                        <select name="member" className="p-3 bg-slate-50 border-none rounded-xl text-sm outline-none" required>
+                                            <option value="">選擇社友</option>
+                                            {members.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                                        </select>
+                                        <input name="item" placeholder="內容(例:聯合例會)" className="p-3 bg-slate-50 border-none rounded-xl text-sm outline-none" required />
+                                        <input name="amount" type="number" placeholder="金額" className="p-3 bg-slate-50 border-none rounded-xl text-sm font-bold outline-none" required />
+                                        <button className="md:col-span-4 bg-blue-600 text-white py-4 rounded-2xl font-black shadow-lg shadow-blue-100 hover:bg-blue-700 transition-all active:scale-[0.98]">存入雲端數據庫</button>
+                                    </form>
+                                </div>
+                                <div className="bg-white rounded-[2rem] border border-slate-100 shadow-sm overflow-hidden">
+                                    <div className="p-5 bg-slate-50/50 font-black border-b border-slate-100 text-slate-500 uppercase tracking-widest text-xs">本月已錄入明細</div>
+                                    <div className="divide-y divide-slate-50">
+                                        {transactions.filter(t=>t.month===currentMonth).map(t => (
+                                            <div key={t.id} className="p-4 flex justify-between items-center hover:bg-slate-50">
+                                                <div className="text-sm">
+                                                    <span className="font-bold text-slate-800">{members.find(m=>m.id===t.memberId)?.name}</span>
+                                                    <span className="mx-2 text-slate-200">|</span>
+                                                    <span className="text-slate-500">{t.item}</span>
+                                                </div>
+                                                <div className="flex items-center gap-4">
+                                                    <span className="font-mono font-black">${t.amount.toLocaleString()}</span>
+                                                    <button onClick={() => window.FB_CORE.deleteDoc(window.FB_CORE.doc(db, `artifacts/${typeof __app_id!=='undefined'?__app_id:'rotary-shomei-final'}/public/data/transactions`, t.id))} className="text-slate-200 hover:text-red-400">✕</button>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* 設定區 */}
+                        {activeTab === 'settings' && (
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-8 max-w-5xl mx-auto">
+                                <div className="bg-white p-8 rounded-[2rem] border border-slate-100 shadow-xl">
+                                    <h3 className="font-black mb-6 text-xl tracking-tight">社友名單管理</h3>
+                                    <form className="flex gap-2 mb-6" onSubmit={async e => {
+                                        e.preventDefault();
+                                        const { collection, addDoc } = window.FB_CORE;
+                                        const appId = typeof __app_id !== 'undefined' ? __app_id : 'rotary-shomei-final';
+                                        await addDoc(collection(db, `artifacts/${appId}/public/data/members`), { name: e.target.name.value, nickname: e.target.nick.value });
+                                        e.target.reset();
+                                    }}>
+                                        <input name="name" placeholder="姓名" className="flex-1 p-3 bg-slate-50 border-none rounded-xl outline-none" required />
+                                        <input name="nick" placeholder="Nick" className="flex-1 p-3 bg-slate-50 border-none rounded-xl outline-none" />
+                                        <button className="bg-slate-900 text-white px-6 rounded-xl font-bold hover:bg-slate-800">加入</button>
+                                    </form>
+                                    <div className="divide-y divide-slate-50 max-h-[30rem] overflow-auto border-t border-slate-50 mt-4">
+                                        {members.map(m => (
+                                            <div key={m.id} className="py-3 flex justify-between items-center group">
+                                                <span className="font-bold text-slate-700">{m.name} ({m.nickname})</span>
+                                                <button onClick={() => {if(confirm(`確定刪除 ${m.name}？`)) window.FB_CORE.deleteDoc(window.FB_CORE.doc(db, `artifacts/${typeof __app_id!=='undefined'?__app_id:'rotary-shomei-final'}/public/data/members`, m.id))}} className="text-slate-200 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity">✕</button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                                <div className="bg-white p-8 rounded-[2rem] border border-slate-100 shadow-xl h-fit">
+                                    <h3 className="font-black mb-6 text-xl tracking-tight text-blue-600">自定義帳單欄位</h3>
+                                    <form className="flex gap-2 mb-4" onSubmit={async e => {
+                                        e.preventDefault();
+                                        const { collection, addDoc } = window.FB_CORE;
+                                        const appId = typeof __app_id !== 'undefined' ? __app_id : 'rotary-shomei-final';
+                                        await addDoc(collection(db, `artifacts/${appId}/public/data/field_configs`), { name: e.target.fname.value });
+                                        e.target.reset();
+                                    }}>
+                                        <input name="fname" placeholder="欄位名稱" className="flex-1 p-3 bg-slate-50 border-none rounded-xl outline-none" required />
+                                        <button className="bg-blue-600 text-white px-6 rounded-xl font-bold hover:bg-blue-700">新增</button>
+                                    </form>
+                                    <div className="divide-y divide-slate-50 border-t border-slate-50 mt-4">
+                                        {fieldConfigs.map(f => (
+                                            <div key={f.id} className="py-3 flex justify-between group items-center">
+                                                <span className="font-bold text-slate-600">{f.name}</span>
+                                                <button onClick={() => window.FB_CORE.deleteDoc(window.FB_CORE.doc(db, `artifacts/${typeof __app_id!=='undefined'?__app_id:'rotary-shomei-final'}/public/data/field_configs`, f.id))} className="text-slate-200 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity">✕</button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </main>
+                </div>
+            );
+        };
+
+        const NavItem = ({ active, onClick, icon, label }) => (
+            <button onClick={onClick} className={`flex items-center gap-4 px-5 py-4 rounded-2xl transition-all duration-300 ${active?'tab-active':'text-slate-400 hover:bg-slate-800 hover:text-white'}`}>
+                <span className="text-xl">{icon}</span><span className="font-bold tracking-tight">{label}</span>
+            </button>
+        );
+
+        const StatCard = ({ title, value, color }) => {
+            const colors = { blue: "bg-blue-600 text-white shadow-blue-200", slate: "bg-white text-slate-700 border-slate-100", orange: "bg-white text-orange-600 border-orange-100", green: "bg-green-50 text-green-700 border-green-100" };
+            return (
+                <div className={`p-6 rounded-[2rem] border shadow-lg ${colors[color]}`}>
+                    <p className={`text-[10px] font-black uppercase tracking-widest mb-1 ${color==='blue'?'text-blue-200':'text-slate-400'}`}>{title}</p>
+                    <p className="text-2xl font-black font-mono tracking-tighter">{value}</p>
+                </div>
+            );
+        };
+
+        const TabBtn = ({ active, onClick, icon, label }) => (
+            <button onClick={onClick} className={`flex items-center gap-4 px-4 py-3 rounded-xl transition-all ${active?'tab-active':'text-slate-400 hover:bg-slate-800'}`}>
+                <span className="text-lg">{icon}</span><span className="font-bold">{label}</span>
+            </button>
+        );
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
